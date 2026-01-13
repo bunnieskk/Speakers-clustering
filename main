@@ -1,0 +1,313 @@
+# clustering_ahc_eval.py
+"""
+Agglomerative Hierarchical Clustering (AHC) + Clustering Evaluation
+Compatible with:
+  - config.py (Config: model_name, cache_dir, device, pooling, l2_normalize, embedding_layers/embedding_layer)
+  - data_loader.py (DataConfig, build_dataloader)
+  - model.py (WavLMEmbedder.forward_layers)
+
+Typical usage:
+  # 1) Known number of clusters (K)
+  python clustering_ahc_eval.py --max_items 1000 --num_clusters 20
+
+  # 2) Unknown K, cut by distance threshold (cosine distance)
+  python clustering_ahc_eval.py --max_items 1000 --threshold 0.35
+
+Optional evaluation (needs labels):
+  python clustering_ahc_eval.py --max_items 1000 --num_clusters 20 --label_field speaker_id
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import argparse
+from dataclasses import asdict
+from typing import Dict, List, Optional, Tuple, Any
+
+import numpy as np
+import torch
+
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+from scipy.optimize import linear_sum_assignment
+
+# Your existing modules
+from config import config as EmbConfig  # Config instance
+from data_loader import DataConfig, build_dataloader
+from model import WavLMEmbedder
+
+
+# -----------------------------
+# Utils: clustering + metrics
+# -----------------------------
+def _to_numpy(x: torch.Tensor | np.ndarray) -> np.ndarray:
+    if isinstance(x, np.ndarray):
+        return x
+    return x.detach().cpu().numpy()
+
+
+def cosine_distance_matrix(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """
+    X: [N, D]
+    Return: cosine distance matrix [N, N] in [0, 2]
+      dist = 1 - cos_sim
+    """
+    # Normalize again for safety
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    Xn = X / np.clip(norms, eps, None)
+    sim = np.clip(Xn @ Xn.T, -1.0, 1.0)
+    dist = 1.0 - sim
+    return dist
+
+
+def ahc_cluster(
+    X: np.ndarray,
+    num_clusters: Optional[int] = None,
+    threshold: Optional[float] = None,
+    linkage: str = "average",
+) -> np.ndarray:
+    """
+    AHC using cosine distance.
+    Choose ONE of:
+      - num_clusters: fixed K
+      - threshold: distance threshold (smaller -> more clusters)
+    Returns: cluster_labels [N]
+    """
+    if (num_clusters is None) == (threshold is None):
+        raise ValueError("Provide exactly one of num_clusters or threshold.")
+
+    dist = cosine_distance_matrix(X)
+
+    # sklearn AHC supports precomputed distances
+    # NOTE: For sklearn >= 1.2 use metric="precomputed"; older uses affinity="precomputed"
+    try:
+        model = AgglomerativeClustering(
+            n_clusters=num_clusters,
+            distance_threshold=threshold,
+            linkage=linkage,
+            metric="precomputed",
+        )
+    except TypeError:
+        model = AgglomerativeClustering(
+            n_clusters=num_clusters,
+            distance_threshold=threshold,
+            linkage=linkage,
+            affinity="precomputed",
+        )
+
+    pred = model.fit_predict(dist)
+    return pred
+
+
+def purity_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Purity = sum_k max_j |C_k ∩ L_j| / N
+    """
+    y_true = y_true.astype(int)
+    y_pred = y_pred.astype(int)
+    N = y_true.shape[0]
+    purity = 0
+    for c in np.unique(y_pred):
+        idx = np.where(y_pred == c)[0]
+        if idx.size == 0:
+            continue
+        labels, counts = np.unique(y_true[idx], return_counts=True)
+        purity += counts.max()
+    return float(purity) / float(N)
+
+
+def cluster_accuracy_hungarian(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Cluster assignment accuracy via Hungarian matching.
+    Works when y_true are class ids and y_pred are cluster ids (arbitrary permutation).
+    """
+    y_true = y_true.astype(int)
+    y_pred = y_pred.astype(int)
+    classes = np.unique(y_true)
+    clusters = np.unique(y_pred)
+
+    # Build confusion matrix: rows=clusters, cols=classes
+    cm = np.zeros((clusters.size, classes.size), dtype=np.int64)
+    for i, c in enumerate(clusters):
+        idx = np.where(y_pred == c)[0]
+        if idx.size == 0:
+            continue
+        for j, k in enumerate(classes):
+            cm[i, j] = np.sum(y_true[idx] == k)
+
+    # Hungarian finds min cost; use negative counts as cost
+    row_ind, col_ind = linear_sum_assignment(-cm)
+    matched = cm[row_ind, col_ind].sum()
+    return float(matched) / float(y_true.size)
+
+
+def eval_clustering(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """
+    Evaluate clustering quality (label-based).
+    """
+    return {
+        "NMI": float(normalized_mutual_info_score(y_true, y_pred)),
+        "ARI": float(adjusted_rand_score(y_true, y_pred)),
+        "Purity": float(purity_score(y_true, y_pred)),
+        "ACC": float(cluster_accuracy_hungarian(y_true, y_pred)),
+    }
+
+
+# -----------------------------
+# Embedding extraction (matches your pipeline)
+# -----------------------------
+@torch.no_grad()
+def extract_embeddings_all_layers(
+    embedder: WavLMEmbedder,
+    dataloader,
+    layers: List[int],
+    pooling: str,
+    l2_normalize: bool,
+    label_field: Optional[str] = None,
+) -> Tuple[Dict[int, np.ndarray], List[Any], Optional[np.ndarray]]:
+    """
+    Returns:
+      layer_to_X: {layer: [N, D]}
+      ids: list length N
+      y_true: [N] or None
+    """
+    layer_to_list: Dict[int, List[np.ndarray]] = {l: [] for l in layers}
+    ids_all: List[Any] = []
+    y_all: List[Any] = []
+
+    for batch in dataloader:
+        input_values = batch["input_values"]
+        attention_mask = batch["attention_mask"]
+        ids = batch["ids"]
+        ids_all.extend(ids)
+
+        # NOTE: your dataloader currently returns no labels.
+        # If you later add labels into collate_audio, handle it here.
+        if label_field is not None and label_field in batch:
+            y_all.extend(batch[label_field])
+
+        layer_to_emb = embedder.forward_layers(
+            input_values=input_values,
+            attention_mask=attention_mask,
+            layers=layers,
+            pooling=pooling,
+            l2_normalize=l2_normalize,
+        )
+        for l in layers:
+            layer_to_list[l].append(layer_to_emb[l])
+
+    layer_to_X = {l: np.concatenate(layer_to_list[l], axis=0) for l in layers}
+    y_true = None
+    if label_field is not None and len(y_all) == len(ids_all):
+        # Convert arbitrary labels to 0..K-1
+        uniq = {v: i for i, v in enumerate(sorted(set(y_all)))}
+        y_true = np.array([uniq[v] for v in y_all], dtype=np.int64)
+
+    return layer_to_X, ids_all, y_true
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--max_items", type=int, default=1000, help="How many samples to materialize/use.")
+    ap.add_argument("--num_clusters", type=int, default=None, help="Known number of speakers/clusters K.")
+    ap.add_argument("--threshold", type=float, default=None, help="AHC distance threshold (cosine distance).")
+    ap.add_argument("--linkage", type=str, default="average", choices=["average", "complete", "single", "ward"])
+    ap.add_argument("--label_field", type=str, default=None, help="Optional label field name in batch for evaluation.")
+    ap.add_argument("--out", type=str, default=None, help="Output json path. Default: outputs/ahc_results.json")
+    args = ap.parse_args()
+
+    # Resolve layers from config (supports both new and old style)
+    if hasattr(EmbConfig, "embedding_layers"):
+        layers = list(getattr(EmbConfig, "embedding_layers"))
+    else:
+        layers = [int(getattr(EmbConfig, "embedding_layer", 16))]
+
+    # Build dataloader
+    data_cfg = DataConfig(
+        sample_rate=EmbConfig.sample_rate,
+        batch_size=EmbConfig.embed_batch_size,
+        cache_dir=EmbConfig.cache_dir,
+        streaming=True,
+    )
+    dl = build_dataloader(data_cfg, max_items=args.max_items)
+
+    # Build embedder
+    embedder = WavLMEmbedder(
+        model_name=EmbConfig.model_name,
+        device=EmbConfig.device,
+        cache_dir=EmbConfig.cache_dir,
+    )
+
+    # Extract embeddings for all layers
+    layer_to_X, ids_all, y_true = extract_embeddings_all_layers(
+        embedder=embedder,
+        dataloader=dl,
+        layers=layers,
+        pooling=EmbConfig.pooling,
+        l2_normalize=EmbConfig.l2_normalize,
+        label_field=args.label_field,
+    )
+
+    # Run clustering per layer
+    results = {
+        "config": {
+            "embed_config": {k: v for k, v in EmbConfig.__dict__.items() if not k.startswith("_")},
+            "data_config": asdict(data_cfg),
+            "layers": layers,
+            "num_clusters": args.num_clusters,
+            "threshold": args.threshold,
+            "linkage": args.linkage,
+            "label_field": args.label_field,
+            "max_items": args.max_items,
+        },
+        "per_layer": {},
+    }
+
+    for layer, X in layer_to_X.items():
+        pred = ahc_cluster(
+            X=X,
+            num_clusters=args.num_clusters,
+            threshold=args.threshold,
+            linkage=args.linkage,
+        )
+
+        layer_res = {
+            "num_samples": int(X.shape[0]),
+            "embedding_dim": int(X.shape[1]),
+            "num_pred_clusters": int(np.unique(pred).size),
+        }
+
+        if y_true is not None:
+            layer_res.update(eval_clustering(y_true, pred))
+
+        # Save assignments (id -> cluster)
+        assignments = {str(ids_all[i]): int(pred[i]) for i in range(len(ids_all))}
+        layer_res["assignments"] = assignments
+
+        results["per_layer"][str(layer)] = layer_res
+
+    # Output
+    out_path = args.out
+    if out_path is None:
+        os.makedirs(EmbConfig.output_dir, exist_ok=True)
+        out_path = os.path.join(EmbConfig.output_dir, "ahc_results.json")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    print(f"[OK] Saved: {out_path}")
+    print("Layers:", layers)
+    for layer in layers:
+        info = results["per_layer"][str(layer)]
+        msg = f"Layer {layer}: clusters={info['num_pred_clusters']}"
+        if "NMI" in info:
+            msg += f" | NMI={info['NMI']:.4f} ARI={info['ARI']:.4f} Purity={info['Purity']:.4f} ACC={info['ACC']:.4f}"
+        print(msg)
+
+
+if __name__ == "__main__":
+    main()
